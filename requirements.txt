@@ -1,0 +1,25 @@
+# ── NOTE ─────────────────────────────────────────────────────────────────────
+# torch, torchvision, and torch-geometric/scatter/sparse/cluster must be
+# installed manually — see README.md Setup section.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Chemistry / Visualization ─────────────────────────────────────────────────
+rdkit>=2023.9.5          # molecular graph rendering
+networkx>=3.2            # acquisition-order graph plots
+
+# ── Data & Numerics ───────────────────────────────────────────────────────────
+numpy>=1.26
+pandas>=2.2
+scikit-learn>=1.4        # metrics, train/val splits
+
+# ── Training Utilities ────────────────────────────────────────────────────────
+tqdm>=4.66               # progress bars
+gymnasium>=0.29          # RL environment base class (optional but handy)
+
+# ── Plotting ──────────────────────────────────────────────────────────────────
+matplotlib>=3.8
+seaborn>=0.13
+
+# ── Notebooks ─────────────────────────────────────────────────────────────────
+jupyter>=1.0
+ipykernel>=6.29
