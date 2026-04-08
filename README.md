@@ -11,7 +11,6 @@ An RL agent that learns *which* quantum-chemical properties of a molecule to obs
 SERAPH/
 ├── config.py                          # all hyperparameters in one place
 ├── requirements.txt
-├── scaffold.sh                        # run once to create directory tree
 │
 ├── data/
 │   └── load_qm9.py                    # QM9 loading & preprocessing
