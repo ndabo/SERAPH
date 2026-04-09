@@ -4,7 +4,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Chemistry / Visualization ─────────────────────────────────────────────────
-rdkit>=2023.9.5          # molecular graph rendering
+rdkit==2024.9.2          # molecular graph rendering — newer versions break QM9 parsing
 networkx>=3.2            # acquisition-order graph plots
 
 # ── Data & Numerics ───────────────────────────────────────────────────────────
