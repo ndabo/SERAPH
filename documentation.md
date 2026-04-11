@@ -89,6 +89,71 @@ Over training, the agent runs thousands of these episodes across different molec
 
 A smoke test — run the file directly to verify everything works and print normalization stats for all 19 properties:
 
-```bash
-python data/load_qm9.py
 ```
+python environment/acquisition_env.py
+```
+
+---
+
+## `models/predictor.py`
+
+### What it does
+
+A simple MLP (multi-layer perceptron) that takes the current state of an episode and predicts the HOMO-LUMO gap. The input is the same 38-dim vector from the environment:
+
+```
+cat([mask(19), values(19)]) → hidden layers → scalar prediction
+```
+
+Architecture:
+```
+38 → Linear → ReLU → Dropout
+   → Linear → ReLU → Dropout   (repeated num_layers times)
+   → Linear → scalar
+```
+
+It serves two roles in SERAPH:
+
+1. **Inside the RL loop** — after every acquisition, `AcquisitionEnv` calls `predictor.predict(values, mask)` to get the new MSE and compute the reward
+2. **As a standalone baseline** — trained with all 19 features visible (mask = all ones) to get the best possible accuracy — this is the ceiling the RL agent is trying to match with fewer features
+
+---
+
+### `predict()` vs `forward()`
+
+- `forward(x)` — standard PyTorch batch inference, takes a `(B, 38)` tensor, returns `(B, 1)`. Used during training.
+- `predict(values, mask)` — convenience wrapper for the environment. Takes the two separate `(19,)` tensors, concatenates them, runs inference, returns a scalar. Used inside `_compute_mse()`.
+
+---
+
+### `build_xy()`
+
+Builds the training data for the **full-information baseline**. Takes the molecule list and constructs `X` where every molecule has `mask = all ones` (pretending all 19 properties are known), and `y` is the target property. Used in `train_baseline.py`.
+
+---
+
+### `train_one_epoch()`
+
+Standard mini-batch gradient descent — shuffles the data with `randperm`, loops through batches, computes MSE loss, backpropagates. Returns the average loss for the epoch.
+
+---
+
+### How it connects to everything else
+
+```
+load_qm9()  →  build_molecule_list()  →  build_xy()  →  train_one_epoch()
+                                      →  AcquisitionEnv(predictor=model)
+                                                ↓
+                                         predict() called each step
+                                         to compute reward
+```
+
+---
+
+### Smoke test
+
+```
+python models/predictor.py
+```
+
+
