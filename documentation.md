@@ -43,6 +43,48 @@ A utility that flattens an entire DataLoader into a single `(N, 19)` tensor of n
 
 ---
 
+---
+
+## `data/processed/`
+
+### `data_v3.pt` (324 MB)
+
+The main cache. PyG reads all 133,885 molecules from `gdb9.sdf`, converts each one into a graph (atoms as nodes, bonds as edges), attaches the 19 properties from `gdb9.sdf.csv`, excludes the bad molecules from `uncharacterized.txt`, and saves the result as a single PyTorch tensor file. On every run after the first, PyG loads this directly instead of re-parsing the SDF file — which is why startup is fast after the first run.
+
+### `pre_filter.pt` and `pre_transform.pt`
+
+Small metadata files that record what filtering and transformations were applied during processing. PyG checks these on each run — if they match, it reuses `data_v3.pt`. If you change the transform settings, PyG detects the mismatch and reprocesses from scratch.
+
+---
+
+---
+
+## `environment/acquisition_env.py`
+
+### What is an episode?
+
+An episode is one molecule from start to finish.
+
+At the start of each episode (`reset()`), the agent is handed a single molecule with all 19 properties hidden — `mask` is all zeros, `values` is all zeros.
+
+At each step, the agent picks one property to "acquire" (reveal). The environment uncovers that property's value, runs the predictor to see how much better the prediction got, and returns a reward:
+
+```
+reward = Δaccuracy − λ × cost
+```
+
+The agent gains reward when revealing a property meaningfully improves the prediction, and gets penalized just for asking (cost = 1 per feature). This forces it to learn which properties are actually worth looking at.
+
+The episode ends when either:
+- the agent has acquired all 19 properties, or
+- it hits `max_steps` (also 19 by default)
+
+One episode = the agent deciding the optimal order to reveal properties of one molecule, trying to predict the HOMO-LUMO gap as accurately as possible while revealing as few properties as possible.
+
+Over training, the agent runs thousands of these episodes across different molecules and learns a policy: "given what I've seen so far, which property should I look at next?"
+
+---
+
 ### `__main__` block (lines 198–214)
 
 A smoke test — run the file directly to verify everything works and print normalization stats for all 19 properties:
