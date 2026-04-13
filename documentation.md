@@ -156,4 +156,96 @@ load_qm9()  →  build_molecule_list()  →  build_xy()  →  train_one_epoch()
 python models/predictor.py
 ```
 
+---
+
+## `models/dqn_agent.py`
+
+### The big picture
+
+The DQN agent's job is to look at the current state of an episode (which properties have been revealed so far) and decide which property to acquire next. It learns this through trial and error across thousands of episodes.
+
+The file has three main components: **ReplayBuffer**, **QNetwork**, and **DQNAgent**.
+
+---
+
+### `ReplayBuffer`
+
+Every time the agent takes a step in the environment, that experience gets stored as a transition:
+```
+(state, action, reward, next_state, done)
+```
+The buffer holds up to `REPLAY_SIZE` (10,000) of these. When it's full, the oldest ones get overwritten. During training, random mini-batches are sampled from it — this breaks the correlation between consecutive steps, which is crucial for stable learning.
+
+Transitions are stored on CPU to save GPU memory, and moved to MPS/CUDA only when sampled for training.
+
+---
+
+### `QNetwork`
+
+The neural network that learns Q-values:
+```
+state (38-dim) → Linear → ReLU → ... → Q-values (19-dim)
+```
+
+It outputs one Q-value per property. The Q-value for an action represents: *"how much total future reward can I expect if I acquire this property right now?"*
+
+The agent picks the action with the highest Q-value.
+
+---
+
+### `DQNAgent`
+
+The main class that ties everything together. It maintains **two copies** of QNetwork:
+
+- **`online_net`** — trained every step, this is the network that's actively learning
+- **`target_net`** — a frozen snapshot of the online net, only updated every `TARGET_UPDATE` steps
+
+Why two networks? Without the target net, you'd be chasing a moving target during training — the values you're trying to predict keep changing as you update the network, which causes instability.
+
+---
+
+### `select_action()` — ε-greedy
+
+At each step the agent either:
+- **Explores** (with probability ε): picks a random legal action
+- **Exploits** (with probability 1-ε): picks the action with the highest Q-value
+
+ε starts at 1.0 (fully random) and exponentially decays toward 0.05 as training progresses. Illegal actions (already-acquired properties) are masked out with `-inf` so they can never be chosen.
+
+---
+
+### `learn()` — the Bellman update
+
+This is where actual learning happens. It samples a mini-batch from the buffer and computes:
+
+```
+Q_target = reward + γ × max(Q_target_net(next_state))   # if not done
+Q_target = reward                                         # if done
+```
+
+Then it minimizes the difference between what the online net predicted (`Q_current`) and what it should have predicted (`Q_target`) using Huber loss. Gradient clipping is applied to prevent unstable updates early in training.
+
+---
+
+### How it all connects
+
+```
+Episode loop:
+  state = env.reset()
+  while not done:
+      action     = agent.select_action(state, legal_mask)   # ε-greedy
+      next_state, reward, done = env.step(action)
+      agent.store(state, action, reward, next_state, done)  # → ReplayBuffer
+      agent.learn()                                          # sample batch, update online_net
+      every TARGET_UPDATE steps → sync target_net ← online_net
+```
+
+---
+
+### Smoke test
+
+```
+python models/dqn_agent.py
+```
+
 
