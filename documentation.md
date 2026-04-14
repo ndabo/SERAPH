@@ -299,3 +299,22 @@ python training/train_baseline.py --target homo           # train on a different
 ```
 
 
+## `training/train_dqn.py`
+
+### What it does
+
+Trains the DQN agent. Mostly wraps dqn_agent
+
+---
+
+### Training loop
+
+1. For each episode runs the process described in ## `models/dqn_agent.py` under ### How it all connects
+2. Tracks and stores avg_loss and reward per episode
+3. Printss metrics and saves evaluation from `evaluate.py` results determined by eval_every
+
+## `evaluate.py`
+
+### What it does
+
+Evaluates performance of the dqn_agent by tracking the mean total rewards per episode using greedy actions
