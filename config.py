@@ -30,9 +30,9 @@ BATCH_SIZE     = 64
 TARGET_UPDATE  = 500               # steps between target-network syncs
 
 # ── Predictor MLP ─────────────────────────────────────────────────────────────
-PRED_HIDDEN    = 64
+PRED_HIDDEN    = 64 #was 64
 PRED_LAYERS    = 2
-PRED_LR        = 1e-3
+PRED_LR        = 3e-4
 PRED_EPOCHS    = 50                # pre-training epochs for the predictor
 
 # ── Training ──────────────────────────────────────────────────────────────────
