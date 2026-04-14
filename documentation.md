@@ -248,4 +248,54 @@ Episode loop:
 python models/dqn_agent.py
 ```
 
+---
+
+## `training/train_baseline.py`
+
+### What it does
+
+Trains the full-information MLP baseline — the upper-bound model that sees all 19 QM9 properties at once (mask = all ones) and predicts the target property. It answers:
+
+> "What's the best accuracy we could ever achieve if we always acquired every single feature?"
+
+The RL agent's job is to get close to this number using far fewer features. **This script must be run before `train_dqn.py`** — the trained predictor is plugged into the RL environment to generate meaningful reward signals.
+
+---
+
+### Outputs
+
+| File | Description |
+|------|-------------|
+| `checkpoints/predictor_baseline.pt` | Best checkpoint (lowest val MSE) |
+| `results/metrics/baseline_metrics.json` | Per-epoch train/val/test metrics |
+
+---
+
+### Training loop
+
+1. Loads QM9 and builds train/val/test molecule lists
+2. Builds `(X, y)` tensors with `mask = all ones` via `build_xy()` — full information baseline
+3. Trains the `Predictor` MLP with Adam + `ReduceLROnPlateau` scheduler
+4. Saves checkpoint whenever val MSE improves
+5. At the end, loads the best checkpoint and evaluates on the test set
+
+---
+
+### Key metrics
+
+- **MSE(norm)** — what the model trains on, in normalized space
+- **MAE(real)** — the number that matters; average prediction error in original Hartree units
+
+**Current best result: MAE(real) = 0.058 Hartree** (lr=3e-4, 50 epochs). This is the ceiling the RL agent is trying to approach with fewer acquisitions.
+
+---
+
+### Command line usage
+
+```bash
+python training/train_baseline.py                         # uses config.py defaults
+python training/train_baseline.py --lr 3e-4 --epochs 50  # override hyperparams
+python training/train_baseline.py --target homo           # train on a different property
+```
+
 
