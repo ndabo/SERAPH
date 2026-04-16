@@ -127,7 +127,7 @@ def train_dqn(
     val_env   = AcquisitionEnv(val_mols,   stats, predictor=predictor, seed=seed)
     test_env  = AcquisitionEnv(test_mols,  stats, predictor=predictor, seed=seed)
 
-    # ── Agent ─────────────────────────────────────────────────────────────────
+    # ── DQN Agent ─────────────────────────────────────────────────────────────────
     print("[5/5] Building DQN agent …")
     agent = DQNAgent(device=device)
 
@@ -145,7 +145,9 @@ def train_dqn(
     history = []
     start_time = time.time()
 
-    for ep in tqdm(range(1, episodes + 1), desc="Episodes", unit="ep"):
+    pbar = tqdm(range(1, episodes + 1), desc="Episodes", unit="ep")
+
+    for ep in pbar:
 
         reward, loss, steps = run_episode(train_env, agent)
 
@@ -200,12 +202,7 @@ def train_dqn(
     print_metrics("test", test_metrics)
 
     # ── Save metrics ──────────────────────────────────────────────────────────
-    metrics_path = os.path.join(
-        config.RESULTS_DIR,
-        "metrics",
-        "dqn_metrics.json"
-    )
-
+    metrics_path = os.path.join(config.RESULTS_DIR, "metrics", "dqn_metrics.json")
     output = {
         "config": {
             "target": config.TARGET_PROP,

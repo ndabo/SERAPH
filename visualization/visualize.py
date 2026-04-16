@@ -138,7 +138,7 @@ def compare_final_results(baseline_path, dqn_path, save_dir):
     print(f"Comparison saved → {path}")
 
 
-# ── Master Runner ──────────────────────────────────────────────────────────────
+# ── Plot Everything ──────────────────────────────────────────────────────────────
 
 def plot_all(
     baseline_metrics="results/metrics/baseline_metrics.json",
