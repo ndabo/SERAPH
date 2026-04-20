@@ -20,18 +20,18 @@ MAX_STEPS      = NUM_FEATURES      # episode ends when all features acquired
 # ── DQN Agent ─────────────────────────────────────────────────────────────────
 HIDDEN_DIM     = 128               # FC layer width in policy network
 NUM_LAYERS     = 2                 # number of hidden layers
-LR             = 1e-3
-GAMMA          = 0.99              # discount factor
+LR             = 1e-4
+GAMMA          = 0.5             # discount factor #0.99
 EPS_START      = 1.0               # ε-greedy exploration start
-EPS_END        = 0.05
+EPS_END        = 0.15
 EPS_DECAY      = 5000              # steps over which ε decays
 REPLAY_SIZE    = 10_000            # replay buffer capacity
 BATCH_SIZE     = 64
-TARGET_UPDATE  = 500               # steps between target-network syncs
+TARGET_UPDATE  = 200               # steps between target-network syncs was 500
 
 # ── Predictor MLP ─────────────────────────────────────────────────────────────
-PRED_HIDDEN    = 64 #was 64
-PRED_LAYERS    = 2
+PRED_HIDDEN    = 256 #was 64
+PRED_LAYERS    = 3
 PRED_LR        = 3e-4
 PRED_EPOCHS    = 50                # pre-training epochs for the predictor
 

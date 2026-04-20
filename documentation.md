@@ -286,7 +286,7 @@ The RL agent's job is to get close to this number using far fewer features. **Th
 - **MSE(norm)** — what the model trains on, in normalized space
 - **MAE(real)** — the number that matters; average prediction error in original Hartree units
 
-**Current best result: MAE(real) = 0.058 Hartree** (lr=3e-4, 50 epochs). This is the ceiling the RL agent is trying to approach with fewer acquisitions.
+**Current best result: MAE(real) = 0.056 Hartree** (lr=3e-4, 50 epochs). This is the ceiling the RL agent is trying to approach with fewer acquisitions.
 
 ---
 
@@ -296,6 +296,97 @@ The RL agent's job is to get close to this number using far fewer features. **Th
 python training/train_baseline.py                         # uses config.py defaults
 python training/train_baseline.py --lr 3e-4 --epochs 50  # override hyperparams
 python training/train_baseline.py --target homo           # train on a different property
+```
+
+---
+
+## `training/train_dqn.py`
+
+### What it does
+
+The main RL training loop. Trains the DQN agent to learn a cost-efficient feature acquisition policy over QM9 molecules. Must be run **after** `train_baseline.py` — it loads the predictor checkpoint to generate reward signals.
+
+### Training loop
+
+Each episode:
+1. Picks a random molecule from the training set
+2. Agent acquires properties one at a time using ε-greedy selection over the 18 legal actions (target `gap` is never acquirable)
+3. Each step is stored in the replay buffer
+4. Agent learns from sampled mini-batches via the Bellman update
+5. Every `eval_interval` episodes, runs 200 greedy episodes on val molecules and saves best checkpoint
+
+### Outputs
+
+| File | Description |
+|------|-------------|
+| `checkpoints/dqn_best.pt` | Best checkpoint by mean eval reward |
+| `checkpoints/dqn_latest.pt` | Latest checkpoint for resuming |
+| `results/metrics/dqn_training.json` | Per-episode metrics |
+
+### Key things to watch during training
+
+- **loss** should stay stable (below ~5). Exploding loss means LR is too high
+- **ε** decays from 1.0 → 0.05 over `EPS_DECAY` steps — early episodes are mostly random exploration
+- **mean acquired** at eval should drop below 18 as the agent learns to stop early
+- **mean reward** should trend upward over episodes
+
+### Command line usage
+
+```bash
+python training/train_dqn.py                        # uses config.py defaults
+python training/train_dqn.py --episodes 5000        # set number of episodes
+python training/train_dqn.py --lambda 0.2           # higher λ = more frugal agent
+python training/train_dqn.py --resume               # resume from dqn_latest.pt
+```
+
+---
+
+## Bug fixes applied during development
+
+### `acquisition_env.py` — target property masking
+
+The agent was originally able to acquire `gap` (index 4), the property it's trying to predict. This was fixed by:
+- Excluding `target_idx` from `legal_actions()` and `legal_action_mask()`
+- Updating the termination check from `mask.sum() == N_FEATURES` to `len(legal_actions()) == 0`
+
+### `dqn_agent.py` — upgraded to Double DQN
+
+The agent was updated to Double DQN: the online net selects the next action, the target net evaluates it. Illegal actions are masked to `-inf` in the Bellman target. This significantly reduces Q-value overestimation and loss explosion.
+
+### `acquisition_env.py` — reward clipping
+
+Per-step rewards are clipped to `[-5.0, +5.0]` to prevent outlier molecules with extreme target values from destabilising training (standard DQN practice from Atari).
+
+---
+
+## `evaluation/evaluate.py`
+
+### What it does
+
+Compares three acquisition policies on val/test molecules:
+
+1. **SERAPH (RL)** — the learned DQN policy run greedily
+2. **Random** — acquires features in random order
+3. **Greedy** — always picks the feature with the highest marginal MSE gain at that step
+
+For each policy, records predictor MSE after 1, 2, 3, … 18 features acquired. This produces the **accuracy-vs-cost curve** — the central result of the project.
+
+### Outputs
+
+| File | Description |
+|------|-------------|
+| `results/metrics/policy_comparison.json` | Raw numbers per policy |
+| `results/figures/accuracy_vs_cost.png` | The plot |
+
+### Key metric — AUC
+
+Area Under the Cost curve. Lower = better. Measures total MSE across all acquisition steps. Used to compare policies with a single number.
+
+### Command line usage
+
+```bash
+python evaluation/evaluate.py                          # val split, 200 molecules
+python evaluation/evaluate.py --n-eval 500 --split test  # full test evaluation
 ```
 
 

@@ -7,12 +7,14 @@ The agent interacts with one molecule per episode, sequentially deciding
 which of the 19 QM9 properties to "acquire" (observe). After each acquisition
 the predictor re-runs on the newly revealed features and the reward is:
 
-    reward = Δaccuracy − λ × cost
+    reward = Δaccuracy − λ × cost            (then clipped to [-reward_clip, reward_clip])
 
-where Δaccuracy is the reduction in MSE vs the previous step, cost = 1 per
-feature acquired, and λ is the accuracy/cost tradeoff from config.py.
+Per-step reward clipping stabilises DQN training by bounding the Bellman
+target. Without it, outlier molecules (those with extreme true-target values)
+produce huge rewards that stretch Q-value estimates for many updates after.
+This is the standard trick from Atari DQN.
 
-Interface mirrors OpenAI Gym so it is compatible with standard RL libraries:
+Interface mirrors OpenAI Gym:
 
     env = AcquisitionEnv(molecules, stats, predictor)
     state = env.reset()
@@ -20,12 +22,7 @@ Interface mirrors OpenAI Gym so it is compatible with standard RL libraries:
 
 State
 -----
-A dict with two keys:
-    "mask"   : FloatTensor (19,) — 1 if property i has been acquired, else 0
-    "values" : FloatTensor (19,) — normalised property values where acquired,
-                                   0.0 where not yet acquired
-
-The DQN policy network receives torch.cat([mask, values]) → dim 38 input.
+Flat FloatTensor (38,) = cat([mask(19), values(19)]).
 """
 
 import os
@@ -49,43 +46,40 @@ class AcquisitionEnv:
 
     Parameters
     ----------
-    molecules : list of (property_vector,) tuples — each is a FloatTensor (19,)
-                of *normalised* property values for one molecule.
-                Build this from the DataLoaders returned by load_qm9.
-    stats     : dict returned by load_qm9() — contains mean, std, target_idx.
-    predictor : a models.Predictor instance (or None for random baseline).
-                Must implement predictor.predict(values, mask) → scalar.
-    lam       : λ, the cost penalty per feature acquired. Defaults to
-                config.LAMBDA. Sweep this for ablation studies.
-    max_steps : maximum acquisitions per episode (defaults to config.NUM_FEATURES
-                so the agent can acquire everything if it wants to).
-    device    : torch device string ("mps", "cuda", or "cpu").
-    seed      : optional random seed for reproducibility.
+    molecules    : list of FloatTensor (19,) — normalised property vectors.
+    stats        : dict from load_qm9 — contains mean, std, target_idx.
+    predictor    : models.Predictor — implements predict(values, mask) → scalar.
+    lam          : λ cost penalty per feature acquired (config.LAMBDA).
+    max_steps    : maximum acquisitions per episode (default = NUM_FEATURES).
+    device       : torch device string.
+    seed         : optional random seed.
+    reward_clip  : absolute bound on per-step reward. Set to None to disable.
+                   Default 1.0 — matches standard DQN practice and handles
+                   outlier molecules with extreme true-target values.
     """
 
-    # Number of acquirable features
-    N_FEATURES = config.NUM_FEATURES  # 19
-
-    # Flat state dimension fed to the DQN: mask (19) + values (19)
-    STATE_DIM = N_FEATURES * 2        # 38  
+    N_FEATURES = config.NUM_FEATURES   # 19
+    STATE_DIM  = N_FEATURES * 2        # 38
 
     def __init__(
         self,
-        molecules: list,
-        stats: dict,
+        molecules:   list,
+        stats:       dict,
         predictor,
-        lam: float = config.LAMBDA,
-        max_steps: int = config.NUM_FEATURES,
-        device: str = config.DEVICE,
-        seed: Optional[int] = config.SEED,
+        lam:         float = config.LAMBDA,
+        max_steps:   int   = config.NUM_FEATURES,
+        device:      str   = config.DEVICE,
+        seed:        Optional[int] = config.SEED,
+        reward_clip: Optional[float] = 5.0,
     ):
-        self.molecules  = molecules
-        self.stats      = stats
-        self.predictor  = predictor
-        self.lam        = lam
-        self.max_steps  = max_steps
-        self.device     = torch.device(device)
-        self.target_idx = stats["target_idx"]
+        self.molecules   = molecules
+        self.stats       = stats
+        self.predictor   = predictor
+        self.lam         = lam
+        self.max_steps   = max_steps
+        self.device      = torch.device(device)
+        self.target_idx  = stats["target_idx"]
+        self.reward_clip = reward_clip
 
         if seed is not None:
             random.seed(seed)
@@ -93,33 +87,21 @@ class AcquisitionEnv:
             torch.manual_seed(seed)
 
         # Episode state (populated by reset())
-        self._molecule   : Optional[torch.Tensor] = None  # (19,) normalised
-        self._mask       : Optional[torch.Tensor] = None  # (19,) binary
-        self._values     : Optional[torch.Tensor] = None  # (19,) masked values
+        self._molecule   : Optional[torch.Tensor] = None
+        self._mask       : Optional[torch.Tensor] = None
+        self._values     : Optional[torch.Tensor] = None
         self._prev_mse   : float = float("inf")
         self._step       : int   = 0
-
-        # Tracking for info dict
         self._acquired_order : list[int] = []
 
     # ── Core interface ─────────────────────────────────────────────────────────
 
     def reset(self, molecule_idx: Optional[int] = None) -> torch.Tensor:
-        """
-        Start a new episode.
-
-        Parameters
-        ----------
-        molecule_idx : index into self.molecules. If None, sampled randomly.
-
-        Returns
-        -------
-        state : FloatTensor (STATE_DIM,) = cat([mask, values])
-        """
+        """Start a new episode. Returns flat state (38,)."""
         if molecule_idx is None:
             molecule_idx = random.randrange(len(self.molecules))
 
-        self._molecule = self.molecules[molecule_idx].to(self.device)  # (19,)
+        self._molecule = self.molecules[molecule_idx].to(self.device)
         self._mask     = torch.zeros(self.N_FEATURES, device=self.device)
         self._values   = torch.zeros(self.N_FEATURES, device=self.device)
         self._step     = 0
@@ -131,20 +113,7 @@ class AcquisitionEnv:
         return self._get_state()
 
     def step(self, action: int) -> tuple[torch.Tensor, float, bool, dict]:
-        """
-        Acquire the property at index `action`.
-
-        Parameters
-        ----------
-        action : int in [0, N_FEATURES). Must not already be acquired.
-
-        Returns
-        -------
-        state  : FloatTensor (STATE_DIM,) — updated state after acquisition
-        reward : float
-        done   : bool — True if episode should end
-        info   : dict — diagnostic info (mse, acquired_order, etc.)
-        """
+        """Acquire property `action`. Returns (state, reward, done, info)."""
         assert 0 <= action < self.N_FEATURES, \
             f"Invalid action {action} — must be in [0, {self.N_FEATURES})"
         assert self._mask[action] == 0, \
@@ -159,20 +128,28 @@ class AcquisitionEnv:
         self._step += 1
 
         # ── Compute reward ─────────────────────────────────────────────────────
-        new_mse    = self._compute_mse()
-        delta_acc  = self._prev_mse - new_mse   # positive = improvement
-        cost       = 1.0                        # one unit per feature
-        reward     = delta_acc - self.lam * cost
+        new_mse        = self._compute_mse()
+        delta_acc      = self._prev_mse - new_mse        # positive = improvement
+        cost           = 1.0                              # one unit per feature
+        raw_reward     = delta_acc - self.lam * cost
         self._prev_mse = new_mse
 
+        # Per-step reward clipping for DQN stability
+        if self.reward_clip is not None:
+            reward = float(np.clip(raw_reward, -self.reward_clip, self.reward_clip))
+        else:
+            reward = float(raw_reward)
+
         # ── Check termination ──────────────────────────────────────────────────
-        all_acquired = self._mask.sum().item() == self.N_FEATURES
+        all_acquired = len(self.legal_actions()) == 0
         max_reached  = self._step >= self.max_steps
         done         = all_acquired or max_reached
 
         info = {
             "mse"            : new_mse,
             "delta_acc"      : delta_acc,
+            "raw_reward"     : float(raw_reward),
+            "clipped_reward" : reward,
             "step"           : self._step,
             "n_acquired"     : int(self._mask.sum().item()),
             "acquired_order" : list(self._acquired_order),
@@ -184,47 +161,37 @@ class AcquisitionEnv:
     # ── Legal action masking ───────────────────────────────────────────────────
 
     def legal_actions(self) -> list[int]:
-        """Return indices of properties not yet acquired this episode."""
-        return [i for i in range(self.N_FEATURES) if self._mask[i] == 0]
+        """Indices of not-yet-acquired, non-target properties."""
+        return [i for i in range(self.N_FEATURES)
+                if self._mask[i] == 0 and i != self.target_idx]
 
     def legal_action_mask(self) -> torch.Tensor:
-        """
-        Returns a BoolTensor (N_FEATURES,) where True = not yet acquired.
-        Feed this to the DQN to zero-out Q-values for illegal actions before
-        taking the argmax.
-        """
-        return self._mask == 0  # True where not acquired
+        """BoolTensor (N_FEATURES,) — True where action is legal."""
+        mask = self._mask == 0
+        mask[self.target_idx] = False
+        return mask
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
     def _get_state(self) -> torch.Tensor:
-        """Flat state vector: cat([mask, values]) → (STATE_DIM,)."""
-        return torch.cat([self._mask, self._values])  # (38,)
+        return torch.cat([self._mask, self._values])
 
     def _compute_mse(self) -> float:
-        """
-        Ask the predictor for a target estimate given current observations,
-        then return MSE against the true (normalised) target.
-
-        If no predictor is attached (predictor=None), returns the variance of
-        the target across the training set as a fixed baseline MSE.
-        """
+        """MSE between predictor output and true target (normalised)."""
         true_target = self._molecule[self.target_idx].item()
 
         if self.predictor is None:
-            # No predictor: treat baseline MSE as 1.0 (normalised variance)
             return 1.0
 
         with torch.no_grad():
             pred = self.predictor.predict(self._values, self._mask)
 
-        mse = (pred.item() - true_target) ** 2
-        return mse
+        return (pred.item() - true_target) ** 2
 
     # ── Utility ────────────────────────────────────────────────────────────────
 
     def render(self):
-        """Print a simple text summary of the current episode state."""
+        """Text summary of current episode state."""
         if self._molecule is None:
             print("Environment not initialised — call reset() first.")
             return
@@ -244,27 +211,14 @@ class AcquisitionEnv:
         print(f"  Current MSE : {self._prev_mse:.6f}")
 
 
-# ── Dataset helper: build molecule list from DataLoader ───────────────────────
+# ── Dataset helper ─────────────────────────────────────────────────────────────
 
 def build_molecule_list(loader) -> list[torch.Tensor]:
-    """
-    Flatten a PyG DataLoader into a plain list of (19,) property tensors.
-    This is the format AcquisitionEnv expects.
-
-    Usage
-    -----
-        from data.load_qm9 import load_qm9
-        from environment.acquisition_env import build_molecule_list
-
-        train_loader, val_loader, test_loader, stats = load_qm9()
-        molecules = build_molecule_list(train_loader)
-        env = AcquisitionEnv(molecules, stats, predictor=None)
-    """
+    """Flatten a PyG DataLoader into a plain list of (19,) property tensors."""
     molecules = []
     for batch in loader:
-        # batch.y shape: (batch_size, 19) — normalised by _NormalisedSubset
         for y in batch.y:
-            molecules.append(y.squeeze().float())  # (19,)
+            molecules.append(y.squeeze().float())
     print(f"[AcquisitionEnv] Built molecule list: {len(molecules):,} molecules")
     return molecules
 
@@ -281,27 +235,25 @@ if __name__ == "__main__":
     print("\nInitialising environment (no predictor — random baseline) …")
     env = AcquisitionEnv(molecules, stats, predictor=None, seed=42)
 
-    # Run one full episode with random actions
     state = env.reset(molecule_idx=0)
     print(f"\nInitial state shape : {state.shape}")
     print(f"STATE_DIM           : {AcquisitionEnv.STATE_DIM}")
+    print(f"Reward clip         : {env.reward_clip}")
 
-    total_reward = 0.0
-    done = False
+    total_reward, done = 0.0, False
     while not done:
         action = random.choice(env.legal_actions())
         state, reward, done, info = env.step(action)
         total_reward += reward
         print(f"  step {info['step']:>2} | acquired '{PROPERTY_NAMES[action]:<12}' "
-              f"| reward={reward:+.5f} | mse={info['mse']:.5f}")
+              f"| reward={reward:+.5f} (raw={info['raw_reward']:+.5f}) "
+              f"| mse={info['mse']:.5f}")
 
     print(f"\nEpisode complete.")
     print(f"  Total reward    : {total_reward:.4f}")
     print(f"  Features used   : {info['n_acquired']}/{config.NUM_FEATURES}")
-    print(f"  Acquisition order: {info['acquired_names']}")
     env.render()
 
-    # Verify legal action masking works
     env.reset()
     env.step(0)
     env.step(1)

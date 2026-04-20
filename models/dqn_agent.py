@@ -13,14 +13,13 @@ Input  : state (dim 38)
 Hidden : N fully-connected layers with ReLU
 Output : Q-values (dim 19) — one per possible acquisition action
 
-Training follows standard DQN:
-    1. Agent acts ε-greedily, collecting (s, a, r, s', done) transitions
-    2. Transitions are stored in a replay buffer
-    3. Mini-batches are sampled from the buffer to train the online network
-    4. A separate target network (updated every K steps) stabilises training
-
-The legal action mask from AcquisitionEnv is applied before argmax so the
-agent never attempts to acquire an already-acquired property.
+Training follows DOUBLE DQN with legal-action masking:
+    1. Agent acts ε-greedily over legal actions, collecting transitions
+    2. Transitions stored in a replay buffer
+    3. Online net picks next-action; target net evaluates it (Double DQN)
+    4. ILLEGAL actions (already acquired, or target) are masked to -inf in
+       the Bellman target — critical for stability in this env
+    5. Target network synced every TARGET_UPDATE updates
 """
 
 import os
@@ -48,42 +47,20 @@ Transition = namedtuple(
 
 
 class ReplayBuffer:
-    """
-    Fixed-capacity circular buffer storing (s, a, r, s', done) transitions.
-
-    Parameters
-    ----------
-    capacity   : maximum number of transitions stored (oldest overwritten)
-    device     : transitions are returned on this device
-    """
+    """Fixed-capacity circular buffer storing (s, a, r, s', done) transitions."""
 
     def __init__(self, capacity: int = config.REPLAY_SIZE, device: str = config.DEVICE):
         self.buffer = deque(maxlen=capacity)
         self.device = torch.device(device)
 
-    def push(
-        self,
-        state:      torch.Tensor,
-        action:     int,
-        reward:     float,
-        next_state: torch.Tensor,
-        done:       bool,
-    ):
-        """Store one transition. Tensors are moved to CPU to save GPU memory."""
+    def push(self, state, action, reward, next_state, done):
+        """Store one transition. Tensors moved to CPU to save GPU memory."""
         self.buffer.append(Transition(
-            state.cpu(),
-            action,
-            reward,
-            next_state.cpu(),
-            done,
+            state.cpu(), action, reward, next_state.cpu(), done,
         ))
 
     def sample(self, batch_size: int) -> Transition:
-        """
-        Sample a random mini-batch of transitions.
-
-        Returns a Transition of stacked tensors, each shape (batch_size, ...).
-        """
+        """Sample a random mini-batch; returns stacked tensors."""
         batch = random.sample(self.buffer, batch_size)
 
         states      = torch.stack([t.state      for t in batch]).to(self.device)
@@ -102,30 +79,18 @@ class ReplayBuffer:
 
     @property
     def ready(self) -> bool:
-        """True once the buffer holds at least one full batch."""
         return len(self) >= config.BATCH_SIZE
 
 
 # ── Policy network ─────────────────────────────────────────────────────────────
 
 class QNetwork(nn.Module):
-    """
-    The DQN policy network.
-
-    Maps state (38-dim) → Q-values (19-dim, one per action).
-
-    Parameters
-    ----------
-    state_dim  : input dimension (default 38 = 2 × NUM_FEATURES)
-    action_dim : output dimension (default 19 = NUM_FEATURES)
-    hidden_dim : width of each hidden layer
-    num_layers : number of hidden layers
-    """
+    """Maps state (38-dim) → Q-values (19-dim, one per action)."""
 
     def __init__(
         self,
-        state_dim:  int = config.NUM_FEATURES * 2,   # 38
-        action_dim: int = config.NUM_FEATURES,        # 19
+        state_dim:  int = config.NUM_FEATURES * 2,
+        action_dim: int = config.NUM_FEATURES,
         hidden_dim: int = config.HIDDEN_DIM,
         num_layers: int = config.NUM_LAYERS,
     ):
@@ -146,22 +111,12 @@ class QNetwork(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        """Xavier uniform initialization for all linear layers."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x : FloatTensor (B, 38) or (38,)
-
-        Returns
-        -------
-        FloatTensor (B, 19) — Q-value for each action
-        """
         return self.net(x)
 
 
@@ -169,50 +124,45 @@ class QNetwork(nn.Module):
 
 class DQNAgent:
     """
-    DQN agent with experience replay and a target network.
-
-    Maintains two networks:
-        online_net  — trained every step via gradient descent
-        target_net  — frozen copy, synced every TARGET_UPDATE steps
-
-    The Bellman target uses the target network for stability:
-        Q_target = r  +  γ · max_a Q_target(s', a)   (if not done)
-        Q_target = r                                   (if done)
+    Double-DQN agent with experience replay and a target network.
 
     Parameters
     ----------
-    device : torch device string
+    device     : torch device string
+    target_idx : index of the target property (always excluded from legal
+                 actions). If None, no property is excluded. Required for
+                 the Bellman-target illegal-action mask to be correct.
     """
 
-    def __init__(self, device: str = config.DEVICE):
-        self.device = torch.device(device)
+    def __init__(
+        self,
+        device:     str = config.DEVICE,
+        target_idx: Optional[int] = None,
+    ):
+        self.device     = torch.device(device)
+        self.target_idx = target_idx
 
         # Two networks — same architecture, different weights
         self.online_net = QNetwork().to(self.device)
         self.target_net = QNetwork().to(self.device)
-        self._sync_target()            # target starts as a copy of online
-        self.target_net.eval()         # target never trains directly
+        self._sync_target()
+        self.target_net.eval()
 
-        self.optimizer  = torch.optim.Adam(
+        self.optimizer = torch.optim.Adam(
             self.online_net.parameters(), lr=config.LR
         )
-        self.buffer     = ReplayBuffer(device=device)
+        self.buffer = ReplayBuffer(device=device)
 
-        # Training counters
-        self.steps_done : int   = 0    # total env steps taken
-        self.updates_done: int  = 0    # total gradient updates
+        self.steps_done : int = 0
+        self.updates_done: int = 0
 
     # ── Epsilon schedule ───────────────────────────────────────────────────────
 
     @property
     def epsilon(self) -> float:
-        """
-        Exponentially decaying ε — starts at EPS_START, decays to EPS_END
-        over EPS_DECAY steps. Higher ε = more random exploration.
-        """
-        eps = config.EPS_END + (config.EPS_START - config.EPS_END) * \
-              math.exp(-self.steps_done / config.EPS_DECAY)
-        return eps
+        """Exponential decay from EPS_START → EPS_END over EPS_DECAY steps."""
+        return config.EPS_END + (config.EPS_START - config.EPS_END) * \
+               math.exp(-self.steps_done / config.EPS_DECAY)
 
     # ── Action selection ───────────────────────────────────────────────────────
 
@@ -222,61 +172,54 @@ class DQNAgent:
         legal_mask:   torch.Tensor,
         force_greedy: bool = False,
     ) -> int:
-        """
-        ε-greedy action selection with legal action masking.
+        """ε-greedy action selection with legal-action masking."""
+        if not force_greedy:
+            self.steps_done += 1
 
-        Parameters
-        ----------
-        state        : FloatTensor (38,) — current environment state
-        legal_mask   : BoolTensor (19,)  — True where action is legal
-                       (from env.legal_action_mask())
-        force_greedy : if True, always pick the greedy action (for evaluation)
-
-        Returns
-        -------
-        int — index of chosen action
-        """
-        self.steps_done += 1
-
-        # Exploration: random legal action
         if not force_greedy and random.random() < self.epsilon:
             legal_indices = legal_mask.nonzero(as_tuple=True)[0].tolist()
             return random.choice(legal_indices)
 
-        # Exploitation: argmax Q-value over legal actions
         self.online_net.eval()
         with torch.no_grad():
             q_values = self.online_net(
                 state.unsqueeze(0).to(self.device)
-            ).squeeze(0)   # (19,)
+            ).squeeze(0)
 
-        # Mask illegal actions with -inf so they can never be chosen
         q_values[~legal_mask.to(self.device)] = float("-inf")
         return int(q_values.argmax().item())
 
     # ── Storing transitions ────────────────────────────────────────────────────
 
-    def store(
-        self,
-        state:      torch.Tensor,
-        action:     int,
-        reward:     float,
-        next_state: torch.Tensor,
-        done:       bool,
-    ):
+    def store(self, state, action, reward, next_state, done):
         """Push one transition into the replay buffer."""
         self.buffer.push(state, action, reward, next_state, done)
 
     # ── Learning step ──────────────────────────────────────────────────────────
 
-    def learn(self) -> Optional[float]:
+    def _legal_mask_from_state(self, state_batch: torch.Tensor) -> torch.Tensor:
         """
-        Sample a mini-batch from the replay buffer and perform one gradient
-        update on the online network.
+        Derive the legal-action mask from a batch of states.
+
+        The state is cat([mask, values]) so state[:, :NUM_FEATURES] is the
+        acquisition mask: 1 = acquired (illegal), 0 = not yet acquired (legal).
+        The target property is always illegal (it is never acquirable).
 
         Returns
         -------
-        float — TD loss for this update, or None if buffer not yet ready.
+        BoolTensor (B, NUM_FEATURES) — True where the action is legal.
+        """
+        acquired = state_batch[:, :config.NUM_FEATURES]      # (B, 19)
+        legal    = (acquired == 0)                            # (B, 19)
+        if self.target_idx is not None:
+            legal[:, self.target_idx] = False
+        return legal
+
+    def learn(self) -> Optional[float]:
+        """
+        Sample a mini-batch and perform one Double-DQN gradient update.
+
+        Returns TD loss for this update, or None if buffer not yet ready.
         """
         if not self.buffer.ready:
             return None
@@ -284,35 +227,53 @@ class DQNAgent:
         self.online_net.train()
         batch = self.buffer.sample(config.BATCH_SIZE)
 
-        # ── Current Q-values  Q(s, a) ─────────────────────────────────────────
-        # online_net produces Q for all actions; we select the taken action
-        q_current = self.online_net(batch.state)                 # (B, 19)
+        # ── Current Q(s, a) ───────────────────────────────────────────────────
+        q_current = self.online_net(batch.state)              # (B, 19)
         q_current = q_current.gather(
             1, batch.action.unsqueeze(1)
-        ).squeeze(1)                                             # (B,)
+        ).squeeze(1)                                          # (B,)
 
-        # ── Target Q-values  r + γ · max_a Q_target(s', a) ───────────────────
+        # ── Double-DQN target with illegal-action masking ────────────────────
         with torch.no_grad():
-            q_next = self.target_net(batch.next_state)           # (B, 19)
-            q_next_max = q_next.max(dim=1).values                # (B,)
+            # Legal actions at next_state — derived from the mask inside state
+            legal_next = self._legal_mask_from_state(batch.next_state)  # (B, 19)
 
-            # If episode ended, there is no future reward
+            # Online net chooses action (masking illegal to -inf)
+            q_online_next = self.online_net(batch.next_state)           # (B, 19)
+            q_online_next = q_online_next.masked_fill(
+                ~legal_next, float("-inf")
+            )
+            # If a row has NO legal actions (should coincide with done=True),
+            # argmax returns 0 — we'll zero it out below via has_legal.
+            best_actions = q_online_next.argmax(dim=1, keepdim=True)     # (B, 1)
+
+            # Target net evaluates the chosen action
+            q_target_next = self.target_net(batch.next_state)            # (B, 19)
+            q_next_best   = q_target_next.gather(
+                1, best_actions
+            ).squeeze(1)                                                 # (B,)
+
+            # Safety: zero the bootstrap if no legal actions exist
+            has_legal = legal_next.any(dim=1).float()                    # (B,)
+            q_next_best = q_next_best * has_legal
+
+            # Standard Bellman target — no future reward if terminal
             q_target = batch.reward + \
-                       config.GAMMA * q_next_max * (1.0 - batch.done)
+                       config.GAMMA * q_next_best * (1.0 - batch.done)
 
-        # ── Huber loss (smooth L1 — more robust to outliers than MSE) ─────────
+        # ── Huber loss (smooth L1) ────────────────────────────────────────────
         loss = F.smooth_l1_loss(q_current, q_target)
 
         self.optimizer.zero_grad()
         loss.backward()
 
-        # Gradient clipping prevents exploding gradients early in training
-        nn.utils.clip_grad_norm_(self.online_net.parameters(), max_norm=10.0)
+        # Tight gradient clipping — max_norm=1.0 is the standard DQN value.
+        # The old max_norm=10.0 was effectively no clipping.
+        nn.utils.clip_grad_norm_(self.online_net.parameters(), max_norm=1.0)
 
         self.optimizer.step()
         self.updates_done += 1
 
-        # ── Periodically sync target network ──────────────────────────────────
         if self.updates_done % config.TARGET_UPDATE == 0:
             self._sync_target()
 
@@ -334,6 +295,7 @@ class DQNAgent:
             "optimizer":    self.optimizer.state_dict(),
             "steps_done":   self.steps_done,
             "updates_done": self.updates_done,
+            "target_idx":   self.target_idx,
         }, path)
         print(f"[DQNAgent] Saved → {path}")
 
@@ -344,6 +306,8 @@ class DQNAgent:
         self.optimizer.load_state_dict(ckpt["optimizer"])
         self.steps_done   = ckpt["steps_done"]
         self.updates_done = ckpt["updates_done"]
+        if ckpt.get("target_idx") is not None:
+            self.target_idx = ckpt["target_idx"]
         print(f"[DQNAgent] Loaded ← {path}  "
               f"(step {self.steps_done}, ε={self.epsilon:.3f})")
 
@@ -361,73 +325,57 @@ if __name__ == "__main__":
 
     print("Building predictor + agent …")
     predictor = Predictor()
-    agent     = DQNAgent()
+    agent     = DQNAgent(target_idx=stats["target_idx"])
 
     n_params = sum(p.numel() for p in agent.online_net.parameters())
     print(f"  QNetwork params : {n_params:,}")
     print(f"  Replay capacity : {config.REPLAY_SIZE:,}")
+    print(f"  Target idx      : {agent.target_idx}")
     print(f"  Device          : {agent.device}")
 
-    # ── Run a few episodes to populate the replay buffer ──────────────────────
     env = AcquisitionEnv(molecules, stats, predictor=predictor, seed=42)
 
     print(f"\nRunning 3 episodes to populate replay buffer …")
     for ep in range(3):
         state = env.reset()
-        done  = False
-        ep_reward, ep_steps = 0.0, 0
-
+        done, ep_reward, ep_steps = False, 0.0, 0
         while not done:
-            legal_mask          = env.legal_action_mask()
-            action              = agent.select_action(state, legal_mask)
+            legal_mask = env.legal_action_mask()
+            action = agent.select_action(state, legal_mask)
             next_state, reward, done, info = env.step(action)
-
             agent.store(state, action, reward, next_state, done)
-
-            state      = next_state
+            state = next_state
             ep_reward += reward
-            ep_steps  += 1
-
+            ep_steps += 1
         print(f"  Episode {ep+1} — steps: {ep_steps}, "
               f"total reward: {ep_reward:+.4f}, "
-              f"ε: {agent.epsilon:.3f}, "
-              f"buffer: {len(agent.buffer)}")
+              f"ε: {agent.epsilon:.3f}, buffer: {len(agent.buffer)}")
 
-    # ── Trigger a learning step ────────────────────────────────────────────────
-    # Buffer won't be ready yet with only 3 short episodes; fill it minimally
     print(f"\nFilling buffer to batch size ({config.BATCH_SIZE}) …")
     state = env.reset()
-    done  = False
+    done = False
     while not agent.buffer.ready:
-        legal_mask              = env.legal_action_mask()
-        action                  = agent.select_action(state, legal_mask)
+        legal_mask = env.legal_action_mask()
+        action = agent.select_action(state, legal_mask)
         next_state, reward, done, info = env.step(action)
         agent.store(state, action, reward, next_state, done)
         state = env.reset() if done else next_state
 
     loss = agent.learn()
     print(f"  First learning step — TD loss: {loss:.6f}")
-    print(f"  Updates done: {agent.updates_done}")
 
-    # ── Greedy episode (no exploration) ───────────────────────────────────────
-    print("\nGreedy episode (ε=0, force_greedy=True) …")
+    print("\nGreedy episode …")
     state = env.reset(molecule_idx=0)
-    done  = False
+    done = False
     while not done:
-        legal_mask              = env.legal_action_mask()
-        action                  = agent.select_action(
-                                    state, legal_mask, force_greedy=True)
+        legal_mask = env.legal_action_mask()
+        action = agent.select_action(state, legal_mask, force_greedy=True)
         state, reward, done, info = env.step(action)
-
     print(f"  Acquired order : {info['acquired_names']}")
-    print(f"  Features used  : {info['n_acquired']}/{config.NUM_FEATURES}")
-    env.render()
 
-    # ── Checkpoint round-trip ──────────────────────────────────────────────────
     save_path = os.path.join(config.CHECKPOINT_DIR, "dqn_test.pt")
     agent.save(save_path)
-    agent2 = DQNAgent()
+    agent2 = DQNAgent(target_idx=stats["target_idx"])
     agent2.load(save_path)
     print(f"\n  Checkpoint round-trip ✓")
-
     print("\n✅  dqn_agent.py working correctly.")

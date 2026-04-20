@@ -5,30 +5,31 @@ The predictor MLP for SERAPH.
 
 Takes a masked property vector (19 values, zeroed where not yet acquired)
 and a binary acquisition mask (19 flags), and predicts the normalised target
-property (e.g. HOMO-LUMO gap).
+property (HOMO-LUMO gap).
 
 The predictor serves two roles in SERAPH:
 
   1. INSIDE the RL environment — called after every acquisition to compute
      the accuracy gain that drives the reward signal. Must be fast.
 
-  2. AS a standalone baseline — trained on all 19 features (mask all ones)
-     to give the upper-bound "full information" performance.
-
-Architecture
-------------
-Input  : cat([mask, values])  →  dim 38
-Hidden : N fully-connected layers with ReLU + optional Dropout
-Output : scalar prediction of the normalised target
+  2. AS a standalone baseline — trained on randomly-masked inputs so it
+     works across the full distribution of acquisition states the RL agent
+     will ever encounter. A separate "full mask" evaluation (all 18 non-
+     target features observed) gives the upper-bound performance number.
 
 The 38-dim input mirrors the state vector in acquisition_env.py so the
 predictor can be slotted directly into the environment without reshaping.
+
+IMPORTANT: the target property is NEVER included in the observed values.
+_sample_mask() always sets mask[target_idx] = 0 so the predictor cannot
+trivially copy the answer from its input.
 """
 
 import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+import numpy as np
 import torch
 import torch.nn as nn
 from typing import Optional
@@ -90,8 +91,8 @@ class Predictor(nn.Module):
         self.net = nn.Sequential(*layers)
         self.to(self.device)
 
-        # Initialise weights with Xavier uniform (better than PyTorch default
-        # for regression tasks with ReLU activations)
+        # Xavier uniform init works better than PyTorch default for
+        # regression tasks with ReLU activations
         self._init_weights()
 
     def _init_weights(self):
@@ -107,8 +108,6 @@ class Predictor(nn.Module):
         Parameters
         ----------
         x : FloatTensor (..., 38) — cat([mask, values]) for one or more molecules.
-            Single molecule:  (38,) or (1, 38)
-            Batched:          (B, 38)
 
         Returns
         -------
@@ -124,7 +123,7 @@ class Predictor(nn.Module):
 
         Parameters
         ----------
-        values : FloatTensor (19,) — normalised property values, 0 where unacquired
+        values : FloatTensor (19,) — normalised property values
         mask   : FloatTensor (19,) — binary acquisition flags
 
         Returns
@@ -132,64 +131,102 @@ class Predictor(nn.Module):
         FloatTensor scalar — predicted normalised target
         """
         self.eval()
+        # Defensive: zero out values at unobserved positions so the predictor
+        # can never see a stale value from a previous episode / init.
+        values = values * mask
         x = torch.cat([mask, values]).unsqueeze(0).to(self.device)  # (1, 38)
         with torch.no_grad():
             pred = self.net(x)   # (1, 1)
         return pred.squeeze()    # scalar
 
 
+# ── Masking utilities ──────────────────────────────────────────────────────────
+
+def _sample_mask(
+    batch_size: int,
+    n_features: int,
+    target_idx: int,
+    device:     torch.device,
+) -> torch.Tensor:
+    """
+    Sample a batch of random acquisition masks.
+
+    For each row we pick k ~ Uniform{0, 1, ..., n_features-1} and choose
+    which k of the NON-TARGET features to mark as observed. The target
+    property is always masked out (mask[target_idx] = 0) — the predictor
+    must not be able to see the answer.
+
+    Returns
+    -------
+    FloatTensor (batch_size, n_features) — 1 where observed, 0 otherwise.
+    """
+    # Number of observed features per row, in [0, n_features-1]
+    k = torch.randint(0, n_features, (batch_size,), device=device)
+
+    # Random scores; force target to have the lowest score so it is never
+    # in the top-k.
+    scores = torch.rand(batch_size, n_features, device=device)
+    scores[:, target_idx] = -1.0
+
+    # Rank each row (rank 0 = highest score); then observed = (rank < k)
+    ranks = scores.argsort(dim=1, descending=True).argsort(dim=1)
+    mask = (ranks < k.unsqueeze(1)).float()
+    return mask
+
+
 # ── Training utilities ─────────────────────────────────────────────────────────
 
-def build_xy(molecules: list[torch.Tensor], target_idx: int, device: str) \
-        -> tuple[torch.Tensor, torch.Tensor]:
+def build_xy(
+    molecules:  list,
+    target_idx: int,
+    device:     str,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Build (X, y) tensors for full-information baseline training.
+    Return raw normalised property values and target values.
 
-    The full-information baseline uses all 19 features (mask = all ones),
-    giving the upper-bound accuracy the RL agent is trying to approach
-    with fewer features.
+    Unlike the old (mask-baked-in) version, this returns the 19-dim values
+    matrix directly — masking is applied per-batch during training so every
+    epoch sees a fresh distribution of acquisition states.
 
     Parameters
     ----------
-    molecules  : list of FloatTensor (19,) — from build_molecule_list()
-    target_idx : column index of the target property (from stats["target_idx"])
+    molecules  : list of FloatTensor (19,) from build_molecule_list()
+    target_idx : column index of the target property
     device     : torch device string
 
     Returns
     -------
-    X : FloatTensor (N, 38) — cat([ones_mask, values]) for each molecule
-    y : FloatTensor (N, 1)  — normalised target values
+    values : FloatTensor (N, 19) — normalised property values
+    y      : FloatTensor (N, 1)  — normalised target values
     """
-    dev = torch.device(device)
-    full_mask = torch.ones(config.NUM_FEATURES, device=dev)
-
-    X_list, y_list = [], []
-    for mol in molecules:
-        mol = mol.to(dev)
-        x   = torch.cat([full_mask, mol])         # (38,)
-        y   = mol[target_idx].unsqueeze(0)        # (1,)
-        X_list.append(x)
-        y_list.append(y)
-
-    X = torch.stack(X_list)   # (N, 38)
-    y = torch.stack(y_list)   # (N, 1)
-    return X, y
+    dev    = torch.device(device)
+    values = torch.stack([mol.to(dev) for mol in molecules])   # (N, 19)
+    y      = values[:, target_idx:target_idx + 1].clone()      # (N, 1)
+    return values, y
 
 
 def train_one_epoch(
-    model:     "Predictor",
-    X:         torch.Tensor,
-    y:         torch.Tensor,
-    optimizer: torch.optim.Optimizer,
+    model:      "Predictor",
+    X:          torch.Tensor,
+    y:          torch.Tensor,
+    optimizer:  torch.optim.Optimizer,
     batch_size: int = config.BATCH_SIZE,
+    target_idx: Optional[int] = None,
 ) -> float:
     """
-    Run one epoch of mini-batch gradient descent.
+    Run one epoch of mini-batch gradient descent with random masks.
+
+    For each mini-batch a fresh mask is sampled per example — this teaches
+    the predictor to cope with ANY subset of observed features, not just
+    the fully-observed case, so it produces meaningful predictions inside
+    the RL environment.
 
     Returns
     -------
     mean training MSE loss for this epoch (float)
     """
+    assert target_idx is not None, "train_one_epoch requires target_idx"
+
     model.train()
     device    = model.device
     N         = X.shape[0]
@@ -199,8 +236,15 @@ def train_one_epoch(
 
     total_loss, n_batches = 0.0, 0
     for start in range(0, N, batch_size):
-        xb = X[start : start + batch_size].to(device)
-        yb = y[start : start + batch_size].to(device)
+        vb = X[start : start + batch_size]            # (B, 19)
+        yb = y[start : start + batch_size]            # (B, 1)
+
+        # Fresh random mask for this batch; target always unobserved
+        mb = _sample_mask(vb.shape[0], config.NUM_FEATURES, target_idx, device)
+
+        # Zero out unobserved values so the input matches what the RL env
+        # will feed at inference time
+        xb = torch.cat([mb, vb * mb], dim=1)          # (B, 38)
 
         optimizer.zero_grad()
         loss = criterion(model(xb), yb)
@@ -215,38 +259,66 @@ def train_one_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: "Predictor",
-    X:     torch.Tensor,
-    y:     torch.Tensor,
-    stats: dict,
+    model:            "Predictor",
+    X:                torch.Tensor,
+    y:                torch.Tensor,
+    stats:            dict,
+    mask_mode:        str = "random",
+    target_idx:       Optional[int] = None,
+    n_random_samples: int = 5,
 ) -> dict:
     """
-    Evaluate the predictor on a held-out split.
+    Evaluate the predictor.
 
-    Returns a dict with:
-        mse_norm  : MSE in normalised space (what the model trains on)
-        mae_norm  : MAE in normalised space
-        mse_real  : MSE in original physical units (un-normalised)
-        mae_real  : MAE in original physical units
+    Parameters
+    ----------
+    X          : FloatTensor (N, 19) — normalised property values
+    y          : FloatTensor (N, 1)  — normalised target values
+    mask_mode  : 'random' — average MSE over `n_random_samples` random masks.
+                            Matches the distribution the RL agent will see.
+                 'full'   — all 18 non-target features observed. The proposal's
+                            upper bound on achievable accuracy.
+    target_idx : column index of the target property (always masked out)
+
+    Returns
+    -------
+    dict with keys: mse_norm, mae_norm, mse_real, mae_real
     """
+    assert target_idx is not None, "evaluate requires target_idx"
+    assert mask_mode in ("random", "full"), f"Unknown mask_mode: {mask_mode}"
+
     model.eval()
     device     = model.device
-    criterion  = nn.MSELoss()
-    target_idx = stats["target_idx"]
     std        = stats["std"][target_idx].to(device)
     mean       = stats["mean"][target_idx].to(device)
 
-    X, y = X.to(device), y.to(device)
-    pred = model(X)  # (N, 1)
+    X, y       = X.to(device), y.to(device)
+    n_features = X.shape[1]
 
-    mse_norm = criterion(pred, y).item()
-    mae_norm = (pred - y).abs().mean().item()
+    def _metrics_for_mask(mb: torch.Tensor) -> tuple[float, float, float, float]:
+        xb   = torch.cat([mb, X * mb], dim=1)     # (N, 38)
+        pred = model(xb)                          # (N, 1)
+        mse_norm = ((pred - y) ** 2).mean().item()
+        mae_norm = (pred - y).abs().mean().item()
 
-    # Un-normalise for real-unit metrics
-    pred_real = pred * std + mean
-    y_real    = y    * std + mean
-    mse_real  = ((pred_real - y_real) ** 2).mean().item()
-    mae_real  = (pred_real  - y_real).abs().mean().item()
+        pred_real = pred * std + mean
+        y_real    = y    * std + mean
+        mse_real = ((pred_real - y_real) ** 2).mean().item()
+        mae_real = (pred_real  - y_real).abs().mean().item()
+        return mse_norm, mae_norm, mse_real, mae_real
+
+    if mask_mode == "full":
+        mask = torch.ones(X.shape[0], n_features, device=device)
+        mask[:, target_idx] = 0.0                 # target is never observed
+        mse_norm, mae_norm, mse_real, mae_real = _metrics_for_mask(mask)
+
+    else:  # random — average over several mask draws
+        results = []
+        for _ in range(n_random_samples):
+            mb = _sample_mask(X.shape[0], n_features, target_idx, device)
+            results.append(_metrics_for_mask(mb))
+        arr = np.array(results)                   # (n_samples, 4)
+        mse_norm, mae_norm, mse_real, mae_real = arr.mean(axis=0).tolist()
 
     return {
         "mse_norm": mse_norm,
@@ -316,14 +388,17 @@ if __name__ == "__main__":
     print(f"\n  Batched forward — input: {batch_x.shape}, output: {batch_y.shape}")
 
     # ── Quick training loop on tiny synthetic data ─────────────────────────────
-    print("\nRunning 5-epoch synthetic training check …")
-    N     = 200
-    X_syn = torch.randn(N, config.NUM_FEATURES * 2)
-    y_syn = torch.randn(N, 1)
-    opt   = torch.optim.Adam(model.parameters(), lr=config.PRED_LR)
+    print("\nRunning 5-epoch synthetic training check (random masks) …")
+    N         = 200
+    target_ix = 4  # pretend gap is column 4
+    X_syn     = torch.randn(N, config.NUM_FEATURES)
+    y_syn     = X_syn[:, target_ix:target_ix + 1].clone()
+    opt       = torch.optim.Adam(model.parameters(), lr=config.PRED_LR)
 
     for epoch in range(5):
-        loss = train_one_epoch(model, X_syn, y_syn, opt, batch_size=32)
+        loss = train_one_epoch(
+            model, X_syn, y_syn, opt, batch_size=32, target_idx=target_ix,
+        )
         print(f"  epoch {epoch+1}/5 — train MSE: {loss:.4f}")
 
     # ── Checkpoint round-trip ──────────────────────────────────────────────────

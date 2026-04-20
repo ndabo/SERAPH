@@ -1,23 +1,29 @@
 """
 training/train_baseline.py
 ───────────────────────────
-Trains the full-information MLP baseline for SERAPH.
+Trains the predictor for SERAPH.
 
-This is the upper-bound model — it sees all 19 QM9 properties at once
-(mask = all ones) and predicts the target property. It answers the question:
+The predictor is trained with RANDOMLY MASKED inputs — on every mini-batch
+each example gets a fresh mask drawn from the same distribution the RL agent
+will produce during acquisition. This is critical: the old "full mask only"
+training produced a model that was out-of-distribution during RL, yielding
+noisy rewards and exploding DQN loss.
 
-    "What's the best MSE we could ever achieve if we always acquired
-     every single feature?"
+Two evaluations are reported each epoch:
 
-The RL agent's job is to get close to this number using far fewer features.
-This script must be run and its checkpoint saved before train_dqn.py,
-because the trained predictor is plugged into the RL environment to generate
-meaningful reward signals.
+  random  — mean MSE over several random-mask samples. This is the number
+            that actually matters for the RL environment.
+  full    — MSE with all 18 non-target features observed. This is the
+            proposal's "full-information" upper bound on achievable accuracy.
+
+The best checkpoint is selected on RANDOM-mask val MSE (what the RL agent
+sees), not full-mask. The target property is always masked out so the
+predictor can never trivially copy it from its input.
 
 Outputs
 -------
-  checkpoints/predictor_baseline.pt   — best val-loss predictor weights
-  results/metrics/baseline_metrics.json — train/val/test metrics per epoch
+  checkpoints/predictor_baseline.pt       — best random-mask val predictor
+  results/metrics/baseline_metrics.json   — train/val/test metrics per epoch
 """
 
 import os
@@ -44,13 +50,12 @@ from models.predictor import (
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def print_metrics(split: str, metrics: dict, stats: dict):
+def print_metrics(label: str, metrics: dict, stats: dict):
     """Pretty-print evaluation metrics in both normalised and real units."""
-    target      = stats["target"]
-    target_idx  = stats["target_idx"]
-    std         = stats["std"][target_idx].item()
+    target_idx = stats["target_idx"]
+    std        = stats["std"][target_idx].item()
 
-    print(f"  {split:<6} | "
+    print(f"  {label:<16} | "
           f"MSE(norm)={metrics['mse_norm']:.5f}  "
           f"MAE(norm)={metrics['mae_norm']:.5f}  "
           f"MAE(real)={metrics['mae_real']:.5f} {PROPERTY_NAMES[target_idx]}-units  "
@@ -60,26 +65,18 @@ def print_metrics(split: str, metrics: dict, stats: dict):
 # ── Main training loop ─────────────────────────────────────────────────────────
 
 def train_baseline(
-    epochs:     int = config.PRED_EPOCHS,
+    epochs:     int   = config.PRED_EPOCHS,
     lr:         float = config.PRED_LR,
-    batch_size: int = config.BATCH_SIZE,
-    device:     str = config.DEVICE,
-    seed:       int = config.SEED,
+    batch_size: int   = config.BATCH_SIZE,
+    device:     str   = config.DEVICE,
+    seed:       int   = config.SEED,
 ) -> Predictor:
     """
-    Train the full-information MLP baseline.
-
-    Parameters
-    ----------
-    epochs     : number of training epochs
-    lr         : learning rate
-    batch_size : mini-batch size
-    device     : torch device string
-    seed       : random seed
+    Train the predictor on randomly-masked QM9 inputs.
 
     Returns
     -------
-    Predictor — the best checkpoint (lowest val MSE)
+    Predictor — the best checkpoint (lowest random-mask val MSE)
     """
     torch.manual_seed(seed)
     os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
@@ -87,7 +84,7 @@ def train_baseline(
 
     # ── Data ──────────────────────────────────────────────────────────────────
     print("=" * 60)
-    print("SERAPH — Baseline Predictor Training")
+    print("SERAPH — Predictor Training (random-mask)")
     print("=" * 60)
     print(f"  Target property : {config.TARGET_PROP}")
     print(f"  Epochs          : {epochs}")
@@ -106,15 +103,17 @@ def train_baseline(
     val_mols   = build_molecule_list(val_loader)
     test_mols  = build_molecule_list(test_loader)
 
-    # Build flat (X, y) tensors — mask = all ones (full information)
-    print("[3/4] Building full-information feature matrices …")
-    target_idx  = stats["target_idx"]
+    # Raw normalised values + targets — masking is applied per-batch
+    print("[3/4] Building feature matrices …")
+    target_idx = stats["target_idx"]
     X_train, y_train = build_xy(train_mols, target_idx, device)
     X_val,   y_val   = build_xy(val_mols,   target_idx, device)
     X_test,  y_test  = build_xy(test_mols,  target_idx, device)
 
     print(f"  Train : {X_train.shape}  Val : {X_val.shape}  "
           f"Test : {X_test.shape}")
+    print(f"  Target : '{PROPERTY_NAMES[target_idx]}' "
+          f"(col {target_idx}) — always masked out")
 
     # ── Model + optimiser ──────────────────────────────────────────────────────
     print("[4/4] Building model …")
@@ -128,7 +127,7 @@ def train_baseline(
     )
 
     # ── Training loop ──────────────────────────────────────────────────────────
-    print(f"\n── Training ({'=' * 40})")
+    print(f"\n── Training {'=' * 45}")
 
     best_val_mse   = float("inf")
     best_ckpt_path = os.path.join(config.CHECKPOINT_DIR, "predictor_baseline.pt")
@@ -137,19 +136,33 @@ def train_baseline(
 
     for epoch in tqdm(range(1, epochs + 1), desc="Epochs", unit="ep"):
 
-        # Train
-        train_loss = train_one_epoch(model, X_train, y_train, optimizer, batch_size)
+        # Train — random masks per batch
+        train_loss = train_one_epoch(
+            model, X_train, y_train, optimizer,
+            batch_size = batch_size,
+            target_idx = target_idx,
+        )
 
-        # Evaluate
-        val_metrics   = evaluate(model, X_val,   y_val,   stats)
-        train_metrics = evaluate(model, X_train, y_train, stats)
+        # Eval — random masks (matches RL env) + full mask (upper bound)
+        val_random = evaluate(
+            model, X_val, y_val, stats,
+            mask_mode="random", target_idx=target_idx, n_random_samples=5,
+        )
+        val_full = evaluate(
+            model, X_val, y_val, stats,
+            mask_mode="full",   target_idx=target_idx,
+        )
+        train_random = evaluate(
+            model, X_train, y_train, stats,
+            mask_mode="random", target_idx=target_idx, n_random_samples=3,
+        )
 
-        # LR scheduler steps on val MSE
-        scheduler.step(val_metrics["mse_norm"])
+        # LR scheduler steps on random-mask val MSE (what the RL agent sees)
+        scheduler.step(val_random["mse_norm"])
 
-        # Save best checkpoint
-        if val_metrics["mse_norm"] < best_val_mse:
-            best_val_mse = val_metrics["mse_norm"]
+        # Save best checkpoint — picked on random-mask val MSE
+        if val_random["mse_norm"] < best_val_mse:
+            best_val_mse = val_random["mse_norm"]
             save_predictor(model, best_ckpt_path)
             improved = " ✓"
         else:
@@ -159,37 +172,50 @@ def train_baseline(
         record = {
             "epoch"      : epoch,
             "train_loss" : train_loss,
-            **{f"train_{k}": v for k, v in train_metrics.items()},
-            **{f"val_{k}"  : v for k, v in val_metrics.items()},
+            **{f"train_random_{k}": v for k, v in train_random.items()},
+            **{f"val_random_{k}"  : v for k, v in val_random.items()},
+            **{f"val_full_{k}"    : v for k, v in val_full.items()},
         }
         history.append(record)
 
         if epoch % 5 == 0 or epoch == 1:
             elapsed = time.time() - start_time
             tqdm.write(f"\nEpoch {epoch}/{epochs}  [{elapsed:.0f}s]{improved}")
-            print_metrics("train", train_metrics, stats)
-            print_metrics("val",   val_metrics,   stats)
+            print_metrics("train (random)", train_random, stats)
+            print_metrics("val   (random)", val_random,   stats)
+            print_metrics("val   (full)",   val_full,     stats)
 
     # ── Final test evaluation ──────────────────────────────────────────────────
     print(f"\n── Test evaluation (best checkpoint) {'=' * 20}")
     from models.predictor import load_predictor
-    best_model   = load_predictor(best_ckpt_path, device=device)
-    test_metrics = evaluate(best_model, X_test, y_test, stats)
-    print_metrics("test", test_metrics, stats)
+    best_model = load_predictor(best_ckpt_path, device=device)
+
+    test_random = evaluate(
+        best_model, X_test, y_test, stats,
+        mask_mode="random", target_idx=target_idx, n_random_samples=10,
+    )
+    test_full = evaluate(
+        best_model, X_test, y_test, stats,
+        mask_mode="full",   target_idx=target_idx,
+    )
+    print_metrics("test (random)", test_random, stats)
+    print_metrics("test (full)",   test_full,   stats)
 
     # ── Save metrics to disk ───────────────────────────────────────────────────
     metrics_path = os.path.join(config.RESULTS_DIR, "metrics", "baseline_metrics.json")
     output = {
         "config": {
-            "target"    : config.TARGET_PROP,
-            "epochs"    : epochs,
-            "lr"        : lr,
-            "batch_size": batch_size,
-            "device"    : device,
+            "target"     : config.TARGET_PROP,
+            "target_idx" : int(target_idx),
+            "epochs"     : epochs,
+            "lr"         : lr,
+            "batch_size" : batch_size,
+            "device"     : device,
         },
-        "test_metrics" : test_metrics,
-        "best_val_mse" : best_val_mse,
-        "history"      : history,
+        "test_random_metrics" : test_random,
+        "test_full_metrics"   : test_full,
+        "best_val_random_mse" : best_val_mse,
+        "history"             : history,
     }
     with open(metrics_path, "w") as f:
         json.dump(output, f, indent=2)
@@ -198,9 +224,10 @@ def train_baseline(
     total_time = time.time() - start_time
     print(f"\n{'=' * 60}")
     print(f"Training complete in {total_time / 60:.1f} min")
-    print(f"Best val MSE  : {best_val_mse:.6f}")
-    print(f"Test MAE(real): {test_metrics['mae_real']:.6f}")
-    print(f"Checkpoint    : {best_ckpt_path}")
+    print(f"Best val MSE (random) : {best_val_mse:.6f}")
+    print(f"Test MAE (random, real): {test_random['mae_real']:.6f}")
+    print(f"Test MAE (full,   real): {test_full['mae_real']:.6f}")
+    print(f"Checkpoint            : {best_ckpt_path}")
     print(f"{'=' * 60}")
 
     return best_model
@@ -211,13 +238,13 @@ def train_baseline(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Train SERAPH baseline predictor")
+    parser = argparse.ArgumentParser(description="Train SERAPH predictor (random-mask)")
     parser.add_argument("--epochs",     type=int,   default=config.PRED_EPOCHS)
     parser.add_argument("--lr",         type=float, default=config.PRED_LR)
     parser.add_argument("--batch-size", type=int,   default=config.BATCH_SIZE)
     parser.add_argument("--device",     type=str,   default=config.DEVICE)
     parser.add_argument("--target",     type=str,   default=config.TARGET_PROP,
-                        help=f"QM9 target property. One of: {list(config.__dict__)}")
+                        help="QM9 target property (e.g. 'gap')")
     args = parser.parse_args()
 
     # Allow overriding the target from the command line
